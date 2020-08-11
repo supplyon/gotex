@@ -36,6 +36,7 @@ package gotex
 import (
 	"bufio"
 	"errors"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -64,19 +65,17 @@ type Options struct {
 // resulting PDF as a []byte. If there's an error, Render will leave the
 // temporary directory intact so you can check the log file to see what
 // happened. The error will tell you where to find it.
-func Render(document string, options Options) ([]byte, error) {
+func Render(document io.Reader, options Options) ([]byte, error) {
 	// Set default options.
 	if options.Command == "" {
 		options.Command = "pdflatex"
 	}
 
-	// Create the temporary directory where LaTeX will dump its ugliness.
-	var dir, err = ioutil.TempDir("", "gotex-")
+	// use current directory as working dir
+	dir, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	// The directory cleanup is purposefully not deferred here because we need
-	// to leave the log file for postmortem in the case of failure.
 
 	// Unless a number was given, don't let automagic mode run more than this
 	// many times.
@@ -104,12 +103,12 @@ func Render(document string, options Options) ([]byte, error) {
 	}
 
 	// Clean up the temp directory.
-	_ = os.RemoveAll(dir)
+	//_ = os.RemoveAll(dir)
 	return output, nil
 }
 
 // runLatex does the actual work of spawning the child and waiting for it.
-func runLatex(document string, options Options, dir string) error {
+func runLatex(document io.Reader, options Options, dir string) error {
 	var args = []string{"-jobname=gotex", "-halt-on-error"}
 
 	// Prepare the command.
@@ -117,7 +116,7 @@ func runLatex(document string, options Options, dir string) error {
 	// Set the cwd to the temporary directory; LaTeX will write all files there.
 	cmd.Dir = dir
 	// Feed the document to LaTeX over stdin.
-	cmd.Stdin = strings.NewReader(document)
+	cmd.Stdin = document
 
 	// Set $TEXINPUTS if requested. The trailing colon means that LaTeX should
 	// include the normal asset directories as well.
