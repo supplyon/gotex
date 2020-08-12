@@ -71,24 +71,89 @@ type Options struct {
 	Logger LogFun
 }
 
-func RenderToFile(document io.Reader, outFilename string, options Options) error {
-	// Set default options.
-	if options.Command == "" {
-		options.Command = "pdflatex"
-	}
-	jobname := "gotex"
+type TexToPDF interface {
+	RenderToFile(document io.Reader, outFilename string) error
+}
 
-	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", jobname))
+// Option represents an option for configuration of texToPDFImpl
+type Option func(tpdf *texToPDFImpl)
+
+// PdfLatexBin specify the binary that shall be used to generate the pdf (full path to pdflatex)
+func PdfLatexBin(cmd string) Option {
+	return func(tpdf *texToPDFImpl) {
+		tpdf.command = cmd
+	}
+}
+
+// Runs specifies the number of rounds the tex to pdf rendering shall be called
+// A value of 0 (default) will result in a mode where the needed runs are detected automatically.
+func Runs(runs int) Option {
+	return func(tpdf *texToPDFImpl) {
+		tpdf.runs = runs
+	}
+}
+
+func TexInputs(inputs ...string) Option {
+	return func(tpdf *texToPDFImpl) {
+		tpdf.texinputs = strings.Join(inputs, ":")
+	}
+}
+
+type texToPDFImpl struct {
+	// Command is the executable to run. It defaults to "pdflatex". Set this to
+	// a full path if $PATH will not be defined in your app's environment.
+	command string
+	// Runs determines how many times Command is run. This is needed for
+	// documents that use refrences and packages that require multiple passes.
+	// If 0, gotex will automagically attempt to determine how many runs are
+	// required by parsing LaTeX log output.
+	runs int
+
+	// Texinputs is a colon-separated list of directories containing assests
+	// such as image files that are needed to compile the document. It is added
+	// to $TEXINPUTS for the LaTeX process.
+	texinputs string
+
+	logger LogFun
+
+	jobname string
+}
+
+func New(options ...Option) TexToPDF {
+
+	currentDir, err := os.Getwd()
+	if err != nil {
+		currentDir = "./"
+	}
+
+	tex := texToPDFImpl{
+		command:   "pdflatex",
+		runs:      0,
+		texinputs: currentDir,
+		jobname:   "gotex",
+	}
+
+	// apply the options
+	for _, opt := range options {
+		opt(&tex)
+	}
+
+	return tex
+}
+
+func (tpdf texToPDFImpl) RenderToFile(document io.Reader, outFilename string) error {
+
+	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", tpdf.jobname))
 	if err != nil {
 		return errors.Wrap(err, "Creating temp dir")
 	}
 	defer os.RemoveAll(dir)
 
-	if err := renderDocument(document, dir, jobname, options); err != nil {
+	if err := tpdf.renderDocument(document, dir); err != nil {
 		return errors.Wrap(err, "Rendering document")
 	}
 
-	generatedFile := path.Join(dir, fmt.Sprintf("%s.pdf", jobname))
+	generatedFile := path.Join(dir, fmt.Sprintf("%s.pdf", tpdf.jobname))
 	err = os.Rename(generatedFile, outFilename)
 	if err != nil {
 		return errors.Wrap(err, "moving generated pdf to target")
@@ -97,47 +162,13 @@ func RenderToFile(document io.Reader, outFilename string, options Options) error
 	return nil
 }
 
-// Render takes the LaTeX document to be rendered as a string. It returns the
-// resulting PDF as a []byte. If there's an error, Render will leave the
-// temporary directory intact so you can check the log file to see what
-// happened. The error will tell you where to find it.
-func Render(document io.Reader, options Options) ([]byte, error) {
-	// Set default options.
-	if options.Command == "" {
-		options.Command = "pdflatex"
-	}
-	jobname := "gotex"
-
-	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", jobname))
-	if err != nil {
-		return nil, errors.Wrap(err, "Creating temp dir")
-	}
-	defer os.RemoveAll(dir)
-
-	if err := renderDocument(document, dir, jobname, options); err != nil {
-		return nil, errors.Wrap(err, "Rendering document")
-	}
-
-	// Slurp the output.
-	output, err := ioutil.ReadFile(path.Join(dir, fmt.Sprintf("%s.pdf", jobname)))
-	if err != nil {
-		return nil, errors.Wrap(err, "read generated pdf into buffer")
-	}
-
-	return output, nil
-}
-
-func renderDocument(document io.Reader, outDir string, jobname string, options Options) error {
-	// Set default options.
-	if options.Command == "" {
-		options.Command = "pdflatex"
-	}
+func (tpdf texToPDFImpl) renderDocument(document io.Reader, outDir string) error {
 
 	// Unless a number was given, don't let automagic mode run more than this
 	// many times.
 	var maxRuns = 5
-	if options.Runs > 0 {
-		maxRuns = options.Runs
+	if tpdf.runs > 0 {
+		maxRuns = tpdf.runs
 	}
 
 	// read the full document into memory
@@ -148,15 +179,15 @@ func renderDocument(document io.Reader, outDir string, jobname string, options O
 	}
 
 	// Keep running until the document is finished or we hit an arbitrary limit.
-	var runs int
+	runs := 0
 	for rerun := true; rerun && runs < maxRuns; runs++ {
 		document = bytes.NewReader(buf)
-		if err := runLatex(document, options, outDir, jobname); err != nil {
+		if err := tpdf.runLatex(document, outDir); err != nil {
 			return errors.Wrap(err, "compile tex to pdf")
 		}
 		// If in automagic mode, determine whether we need to run again.
-		if options.Runs == 0 {
-			rerun, err = needsRerun(outDir, jobname)
+		if tpdf.runs == 0 {
+			rerun, err = needsRerun(outDir, tpdf.jobname)
 			if err != nil {
 				return err
 			}
@@ -166,11 +197,11 @@ func renderDocument(document io.Reader, outDir string, jobname string, options O
 }
 
 // runLatex does the actual work of spawning the child and waiting for it.
-func runLatex(document io.Reader, options Options, dir string, jobname string) error {
-	args := []string{"-halt-on-error", fmt.Sprintf("-jobname=%s", jobname)}
+func (tpdf texToPDFImpl) runLatex(document io.Reader, dir string) error {
+	args := []string{"-halt-on-error", fmt.Sprintf("-jobname=%s", tpdf.jobname)}
 
 	// Prepare the command.
-	cmd := exec.Command(options.Command, args...)
+	cmd := exec.Command(tpdf.command, args...)
 	// Set the cwd to the temporary directory; LaTeX will write all files there.
 	cmd.Dir = dir
 	// Feed the document to LaTeX over stdin.
@@ -178,8 +209,8 @@ func runLatex(document io.Reader, options Options, dir string, jobname string) e
 
 	// Set $TEXINPUTS if requested. The trailing colon means that LaTeX should
 	// include the normal asset directories as well.
-	if options.Texinputs != "" {
-		cmd.Env = append(os.Environ(), "TEXINPUTS="+options.Texinputs+":")
+	if tpdf.texinputs != "" {
+		cmd.Env = append(os.Environ(), "TEXINPUTS="+tpdf.texinputs+":")
 	}
 
 	// Launch and let it finish.
@@ -190,7 +221,7 @@ func runLatex(document io.Reader, options Options, dir string, jobname string) e
 	err = cmd.Wait()
 	if err != nil {
 		// The actual error is useless, do provide a better one from the logfile
-		return getMergedError(dir, jobname)
+		return getMergedError(dir, tpdf.jobname)
 	}
 	return nil
 }
