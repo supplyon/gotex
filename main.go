@@ -35,6 +35,7 @@ package gotex
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -46,6 +47,10 @@ import (
 
 	"github.com/pkg/errors"
 )
+
+type LogFun func(logline string)
+
+var NopLogger = func(logline string) {}
 
 // Options contains the knobs used to change gotex's behavior.
 type Options struct {
@@ -62,6 +67,8 @@ type Options struct {
 	// such as image files that are needed to compile the document. It is added
 	// to $TEXINPUTS for the LaTeX process.
 	Texinputs string
+
+	Logger LogFun
 }
 
 func RenderToFile(document io.Reader, outFilename string, options Options) error {
@@ -75,6 +82,7 @@ func RenderToFile(document io.Reader, outFilename string, options Options) error
 	if err != nil {
 		return errors.Wrap(err, "Creating temp dir")
 	}
+	defer os.RemoveAll(dir)
 
 	if err := renderDocument(document, dir, jobname, options); err != nil {
 		return errors.Wrap(err, "Rendering document")
@@ -86,8 +94,6 @@ func RenderToFile(document io.Reader, outFilename string, options Options) error
 		return errors.Wrap(err, "moving generated pdf to target")
 	}
 
-	// Clean up the temp directory.
-	_ = os.RemoveAll(dir)
 	return nil
 }
 
@@ -106,6 +112,7 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "Creating temp dir")
 	}
+	defer os.RemoveAll(dir)
 
 	if err := renderDocument(document, dir, jobname, options); err != nil {
 		return nil, errors.Wrap(err, "Rendering document")
@@ -117,8 +124,6 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 		return nil, errors.Wrap(err, "read generated pdf into buffer")
 	}
 
-	// Clean up the temp directory.
-	_ = os.RemoveAll(dir)
 	return output, nil
 }
 
@@ -135,15 +140,26 @@ func renderDocument(document io.Reader, outDir string, jobname string, options O
 		maxRuns = options.Runs
 	}
 
+	// read the full document into memory
+	// this is needed to create a new io.Reader for each of (potentially) multiple runs
+	buf, err := ioutil.ReadAll(document)
+	if err != nil {
+		return errors.Wrap(err, "Reading file data")
+	}
+
 	// Keep running until the document is finished or we hit an arbitrary limit.
 	var runs int
 	for rerun := true; rerun && runs < maxRuns; runs++ {
+		document = bytes.NewReader(buf)
 		if err := runLatex(document, options, outDir, jobname); err != nil {
 			return errors.Wrap(err, "compile tex to pdf")
 		}
 		// If in automagic mode, determine whether we need to run again.
 		if options.Runs == 0 {
-			rerun = needsRerun(outDir)
+			rerun, err = needsRerun(outDir, jobname)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -174,11 +190,12 @@ func runLatex(document io.Reader, options Options, dir string, jobname string) e
 	err = cmd.Wait()
 	if err != nil {
 		// The actual error is useless, do provide a better one from the logfile
-		return getFirstError(dir, jobname)
+		return getMergedError(dir, jobname)
 	}
 	return nil
 }
-func getFirstError(texWorkingDir string, jobname string) error {
+
+func getMergedError(texWorkingDir string, jobname string) error {
 	logfile := path.Join(texWorkingDir, fmt.Sprintf("%s.log", jobname))
 	errs, err := getErrorsFromLog(logfile)
 	if err != nil {
@@ -187,12 +204,13 @@ func getFirstError(texWorkingDir string, jobname string) error {
 	if len(errs) == 0 {
 		return fmt.Errorf("No error found even though pdflatex stopped with an error. Something bad happened")
 	}
-	return errs[0]
+
+	return fmt.Errorf("%s", strings.Join(errs, "|"))
 }
 
-func getErrorsFromLog(logfile string) ([]error, error) {
+func getErrorsFromLog(logfile string) ([]string, error) {
 
-	matcher, err := regexp.Compile("^!.*")
+	matcher, err := regexp.Compile("(^!.*|^<\\*>)")
 	if err != nil {
 		return nil, errors.Wrap(err, "compile regex matcher for errors in log")
 	}
@@ -203,12 +221,12 @@ func getErrorsFromLog(logfile string) ([]error, error) {
 	}
 	defer file.Close()
 
-	errs := make([]error, 0)
+	errs := make([]string, 0)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		logline := scanner.Text()
 		if matcher.MatchString(logline) {
-			errs = append(errs, fmt.Errorf(logline))
+			errs = append(errs, strings.TrimSpace(logline))
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -219,19 +237,25 @@ func getErrorsFromLog(logfile string) ([]error, error) {
 
 // Parse the log file and attempt to determine whether another run is necessary
 // to finish the document.
-func needsRerun(dir string) bool {
-	var file, err = os.Open(path.Join(dir, "gotex.log"))
+func needsRerun(dir string, jobname string) (bool, error) {
+	file, err := os.Open(path.Join(dir, fmt.Sprintf("%s.log", jobname)))
 	if err != nil {
-		return false
+		return false, errors.Wrap(err, "Open log file")
 	}
 	defer file.Close()
-	var scanner = bufio.NewScanner(file)
+
+	matcher, err := regexp.Compile(".*Rerun to get.*")
+	if err != nil {
+		return false, errors.Wrap(err, "compile regex matcher for check for needed rerun")
+	}
+
+	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		// Look for a line like:
 		// "Label(s) may have changed. Rerun to get cross-references right."
-		if strings.Contains(scanner.Text(), "Rerun to get") {
-			return true
+		if matcher.MatchString(scanner.Text()) {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
