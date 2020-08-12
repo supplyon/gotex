@@ -48,28 +48,18 @@ import (
 	"github.com/pkg/errors"
 )
 
-type LogFun func(logline string)
+type LogLevel string
 
-var NopLogger = func(logline string) {}
+const (
+	LVL_DEBUG LogLevel = "DBG"
+	LVL_INFO  LogLevel = "INF"
+	LVL_WARN  LogLevel = "WRN"
+	LVL_ERROR LogLevel = "ERR"
+)
 
-// Options contains the knobs used to change gotex's behavior.
-type Options struct {
-	// Command is the executable to run. It defaults to "pdflatex". Set this to
-	// a full path if $PATH will not be defined in your app's environment.
-	Command string
-	// Runs determines how many times Command is run. This is needed for
-	// documents that use refrences and packages that require multiple passes.
-	// If 0, gotex will automagically attempt to determine how many runs are
-	// required by parsing LaTeX log output.
-	Runs int
+type LogFun func(lvl LogLevel, formatStr string, args ...interface{})
 
-	// Texinputs is a colon-separated list of directories containing assests
-	// such as image files that are needed to compile the document. It is added
-	// to $TEXINPUTS for the LaTeX process.
-	Texinputs string
-
-	Logger LogFun
-}
+var NopLogger = func(lvl LogLevel, formatStr string, args ...interface{}) {}
 
 type TexToPDF interface {
 	RenderToFile(document io.Reader, outFilename string) error
@@ -93,9 +83,24 @@ func Runs(runs int) Option {
 	}
 }
 
+func Logger(logFun LogFun) Option {
+	return func(tpdf *texToPDFImpl) {
+		tpdf.logger = logFun
+	}
+}
+
+// TexInputs is a list of folders that contain assets needed to compile the tex file.
+// For example images, style sheets, ...
 func TexInputs(inputs ...string) Option {
 	return func(tpdf *texToPDFImpl) {
 		tpdf.texinputs = strings.Join(inputs, ":")
+	}
+}
+
+// Verbose activates verbose mode where the whole tex log will be printed.
+func Verbose() Option {
+	return func(tpdf *texToPDFImpl) {
+		tpdf.verbose = true
 	}
 }
 
@@ -117,6 +122,8 @@ type texToPDFImpl struct {
 	logger LogFun
 
 	jobname string
+
+	verbose bool
 }
 
 func New(options ...Option) TexToPDF {
@@ -131,6 +138,8 @@ func New(options ...Option) TexToPDF {
 		runs:      0,
 		texinputs: currentDir,
 		jobname:   "gotex",
+		logger:    NopLogger,
+		verbose:   false,
 	}
 
 	// apply the options
@@ -141,7 +150,24 @@ func New(options ...Option) TexToPDF {
 	return tex
 }
 
+func (tpdf texToPDFImpl) logInfo(formatStr string, args ...interface{}) {
+	tpdf.logger(LVL_INFO, formatStr, args...)
+}
+
+func (tpdf texToPDFImpl) logDebug(formatStr string, args ...interface{}) {
+	tpdf.logger(LVL_DEBUG, formatStr, args...)
+}
+
+func (tpdf texToPDFImpl) logWarn(formatStr string, args ...interface{}) {
+	tpdf.logger(LVL_WARN, formatStr, args...)
+}
+
+func (tpdf texToPDFImpl) logError(formatStr string, args ...interface{}) {
+	tpdf.logger(LVL_ERROR, formatStr, args...)
+}
+
 func (tpdf texToPDFImpl) RenderToFile(document io.Reader, outFilename string) error {
+	tpdf.logInfo("Start Rendering tex to %s", outFilename)
 
 	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", tpdf.jobname))
 	if err != nil {
@@ -149,16 +175,21 @@ func (tpdf texToPDFImpl) RenderToFile(document io.Reader, outFilename string) er
 	}
 	defer os.RemoveAll(dir)
 
+	tpdf.logInfo("Temp dir generated at %s", dir)
+
 	if err := tpdf.renderDocument(document, dir); err != nil {
 		return errors.Wrap(err, "Rendering document")
 	}
 
 	generatedFile := path.Join(dir, fmt.Sprintf("%s.pdf", tpdf.jobname))
+	tpdf.logInfo("PDF successfully generated at %s", generatedFile)
+
 	err = os.Rename(generatedFile, outFilename)
 	if err != nil {
-		return errors.Wrap(err, "moving generated pdf to target")
+		return errors.Wrap(err, "Moving generated pdf to target")
 	}
 
+	tpdf.logInfo("PDF %s moved to %s", generatedFile, outFilename)
 	return nil
 }
 
@@ -166,7 +197,7 @@ func (tpdf texToPDFImpl) renderDocument(document io.Reader, outDir string) error
 
 	// Unless a number was given, don't let automagic mode run more than this
 	// many times.
-	var maxRuns = 5
+	maxRuns := 5
 	if tpdf.runs > 0 {
 		maxRuns = tpdf.runs
 	}
@@ -175,15 +206,16 @@ func (tpdf texToPDFImpl) renderDocument(document io.Reader, outDir string) error
 	// this is needed to create a new io.Reader for each of (potentially) multiple runs
 	buf, err := ioutil.ReadAll(document)
 	if err != nil {
-		return errors.Wrap(err, "Reading file data")
+		return errors.Wrap(err, "Reading file content")
 	}
 
 	// Keep running until the document is finished or we hit an arbitrary limit.
 	runs := 0
 	for rerun := true; rerun && runs < maxRuns; runs++ {
+		tpdf.logInfo("Compile round #%d", runs)
 		document = bytes.NewReader(buf)
 		if err := tpdf.runLatex(document, outDir); err != nil {
-			return errors.Wrap(err, "compile tex to pdf")
+			return errors.Wrap(err, "Compile tex to pdf")
 		}
 		// If in automagic mode, determine whether we need to run again.
 		if tpdf.runs == 0 {
@@ -191,6 +223,7 @@ func (tpdf texToPDFImpl) renderDocument(document io.Reader, outDir string) error
 			if err != nil {
 				return err
 			}
+
 		}
 	}
 	return nil
@@ -219,10 +252,37 @@ func (tpdf texToPDFImpl) runLatex(document io.Reader, dir string) error {
 		return err
 	}
 	err = cmd.Wait()
+
+	// print the whole tex log in verbose mode
+	if tpdf.verbose {
+		if err := tpdf.printLogFie(dir, tpdf.jobname); err != nil {
+			return errors.Wrap(err, "Printing log file")
+		}
+	}
+
 	if err != nil {
 		// The actual error is useless, do provide a better one from the logfile
 		return getMergedError(dir, tpdf.jobname)
 	}
+
+	return nil
+}
+
+func (tpdf texToPDFImpl) printLogFie(texWorkingDir string, jobname string) error {
+	logfile := path.Join(texWorkingDir, fmt.Sprintf("%s.log", jobname))
+	file, err := os.Open(logfile)
+	if err != nil {
+		return errors.Wrapf(err, "Opening logfile %s", logfile)
+	}
+	defer file.Close()
+
+	logfileScanner := bufio.NewScanner(file)
+
+	for logfileScanner.Scan() {
+		logline := logfileScanner.Text()
+		tpdf.logDebug(logline)
+	}
+
 	return nil
 }
 
@@ -243,12 +303,12 @@ func getErrorsFromLog(logfile string) ([]string, error) {
 
 	matcher, err := regexp.Compile("(^!.*|^<\\*>)")
 	if err != nil {
-		return nil, errors.Wrap(err, "compile regex matcher for errors in log")
+		return nil, errors.Wrap(err, "Compile regex matcher for errors in log")
 	}
 
 	file, err := os.Open(logfile)
 	if err != nil {
-		return nil, errors.Wrapf(err, "opening logfile %s", logfile)
+		return nil, errors.Wrapf(err, "Opening logfile %s", logfile)
 	}
 	defer file.Close()
 
@@ -261,7 +321,7 @@ func getErrorsFromLog(logfile string) ([]string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, errors.Wrapf(err, "reading logfile %s", logfile)
+		return nil, errors.Wrapf(err, "Reading logfile %s", logfile)
 	}
 	return errs, nil
 }
@@ -277,7 +337,7 @@ func needsRerun(dir string, jobname string) (bool, error) {
 
 	matcher, err := regexp.Compile(".*Rerun to get.*")
 	if err != nil {
-		return false, errors.Wrap(err, "compile regex matcher for check for needed rerun")
+		return false, errors.Wrap(err, "Compile regex matcher for check for needed rerun")
 	}
 
 	scanner := bufio.NewScanner(file)
