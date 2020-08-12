@@ -35,13 +35,16 @@ package gotex
 
 import (
 	"bufio"
-	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // Options contains the knobs used to change gotex's behavior.
@@ -70,11 +73,11 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	if options.Command == "" {
 		options.Command = "pdflatex"
 	}
+	jobname := "gotex"
 
-	// use current directory as working dir
-	dir, err := os.Getwd()
+	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", jobname))
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "Creating temp dir")
 	}
 
 	// Unless a number was given, don't let automagic mode run more than this
@@ -83,12 +86,13 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	if options.Runs > 0 {
 		maxRuns = options.Runs
 	}
+
 	// Keep running until the document is finished or we hit an arbitrary limit.
 	var runs int
 	for rerun := true; rerun && runs < maxRuns; runs++ {
-		err = runLatex(document, options, dir)
+		err = runLatex(document, options, dir, jobname)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "compile tex to pdf")
 		}
 		// If in automagic mode, determine whether we need to run again.
 		if options.Runs == 0 {
@@ -97,22 +101,22 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	}
 
 	// Slurp the output.
-	output, err := ioutil.ReadFile(path.Join(dir, "gotex.pdf"))
+	output, err := ioutil.ReadFile(path.Join(dir, fmt.Sprintf("%s.pdf", jobname)))
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "read generated pdf into buffer")
 	}
 
 	// Clean up the temp directory.
-	//_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(dir)
 	return output, nil
 }
 
 // runLatex does the actual work of spawning the child and waiting for it.
-func runLatex(document io.Reader, options Options, dir string) error {
-	var args = []string{"-jobname=gotex", "-halt-on-error"}
+func runLatex(document io.Reader, options Options, dir string, jobname string) error {
+	args := []string{"-halt-on-error", fmt.Sprintf("-jobname=%s", jobname)}
 
 	// Prepare the command.
-	var cmd = exec.Command(options.Command, args...)
+	cmd := exec.Command(options.Command, args...)
 	// Set the cwd to the temporary directory; LaTeX will write all files there.
 	cmd.Dir = dir
 	// Feed the document to LaTeX over stdin.
@@ -125,16 +129,54 @@ func runLatex(document io.Reader, options Options, dir string) error {
 	}
 
 	// Launch and let it finish.
-	var err = cmd.Start()
+	err := cmd.Start()
 	if err != nil {
 		return err
 	}
 	err = cmd.Wait()
 	if err != nil {
-		// The actual error is useless, do provide a better one.
-		return errors.New("LaTeX error. Check " + path.Join(dir, "gotex.log"))
+		// The actual error is useless, do provide a better one from the logfile
+		return getFirstError(dir, jobname)
 	}
 	return nil
+}
+func getFirstError(texWorkingDir string, jobname string) error {
+	logfile := path.Join(texWorkingDir, fmt.Sprintf("%s.log", jobname))
+	errs, err := getErrorsFromLog(logfile)
+	if err != nil {
+		return errors.Wrap(err, "Get errors from pdflatex log")
+	}
+	if len(errs) == 0 {
+		return fmt.Errorf("No error found even though pdflatex stopped with an error. Something bad happened")
+	}
+	return errs[0]
+}
+
+func getErrorsFromLog(logfile string) ([]error, error) {
+
+	matcher, err := regexp.Compile("^!.*")
+	if err != nil {
+		return nil, errors.Wrap(err, "compile regex matcher for errors in log")
+	}
+
+	file, err := os.Open(logfile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "opening logfile %s", logfile)
+	}
+	defer file.Close()
+
+	errs := make([]error, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		logline := scanner.Text()
+		if matcher.MatchString(logline) {
+			errs = append(errs, fmt.Errorf(logline))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, errors.Wrapf(err, "reading logfile %s", logfile)
+	}
+	return errs, nil
 }
 
 // Parse the log file and attempt to determine whether another run is necessary
