@@ -87,7 +87,7 @@ func RenderToFile(document io.Reader, outFilename string, options Options) error
 	}
 
 	// Clean up the temp directory.
-	_ = os.RemoveAll(dir)
+	//_ = os.RemoveAll(dir)
 	return nil
 }
 
@@ -118,7 +118,7 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	}
 
 	// Clean up the temp directory.
-	_ = os.RemoveAll(dir)
+	//_ = os.RemoveAll(dir)
 	return output, nil
 }
 
@@ -138,6 +138,7 @@ func renderDocument(document io.Reader, outDir string, jobname string, options O
 	// Keep running until the document is finished or we hit an arbitrary limit.
 	var runs int
 	for rerun := true; rerun && runs < maxRuns; runs++ {
+		fmt.Printf("RUN %d\n", runs)
 		if err := runLatex(document, options, outDir, jobname); err != nil {
 			return errors.Wrap(err, "compile tex to pdf")
 		}
@@ -151,7 +152,9 @@ func renderDocument(document io.Reader, outDir string, jobname string, options O
 
 // runLatex does the actual work of spawning the child and waiting for it.
 func runLatex(document io.Reader, options Options, dir string, jobname string) error {
-	args := []string{"-halt-on-error", fmt.Sprintf("-jobname=%s", jobname)}
+	fmt.Printf("SSSSSS %s\n", dir)
+	args := []string{"-halt-on-error", fmt.Sprintf("-jobname=%s", jobname),
+		fmt.Sprintf("-aux-directory=%s", "/home/winnietom/work/newtron/pdf-gen/latexpdf")}
 
 	// Prepare the command.
 	cmd := exec.Command(options.Command, args...)
@@ -174,8 +177,9 @@ func runLatex(document io.Reader, options Options, dir string, jobname string) e
 	err = cmd.Wait()
 	if err != nil {
 		// The actual error is useless, do provide a better one from the logfile
-		return getFirstError(dir, jobname)
+		//return getFirstError(dir, jobname)
 	}
+	getFirstError(dir, jobname)
 	return nil
 }
 func getFirstError(texWorkingDir string, jobname string) error {
@@ -210,6 +214,7 @@ func getErrorsFromLog(logfile string) ([]error, error) {
 		if matcher.MatchString(logline) {
 			errs = append(errs, fmt.Errorf(logline))
 		}
+		fmt.Println(logline)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, errors.Wrapf(err, "reading logfile %s", logfile)
