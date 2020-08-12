@@ -64,6 +64,33 @@ type Options struct {
 	Texinputs string
 }
 
+func RenderToFile(document io.Reader, outFilename string, options Options) error {
+	// Set default options.
+	if options.Command == "" {
+		options.Command = "pdflatex"
+	}
+	jobname := "gotex"
+
+	dir, err := ioutil.TempDir("", fmt.Sprintf("%s-", jobname))
+	if err != nil {
+		return errors.Wrap(err, "Creating temp dir")
+	}
+
+	if err := renderDocument(document, dir, jobname, options); err != nil {
+		return errors.Wrap(err, "Rendering document")
+	}
+
+	generatedFile := path.Join(dir, fmt.Sprintf("%s.pdf", jobname))
+	err = os.Rename(generatedFile, outFilename)
+	if err != nil {
+		return errors.Wrap(err, "moving generated pdf to target")
+	}
+
+	// Clean up the temp directory.
+	_ = os.RemoveAll(dir)
+	return nil
+}
+
 // Render takes the LaTeX document to be rendered as a string. It returns the
 // resulting PDF as a []byte. If there's an error, Render will leave the
 // temporary directory intact so you can check the log file to see what
@@ -80,24 +107,8 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 		return nil, errors.Wrap(err, "Creating temp dir")
 	}
 
-	// Unless a number was given, don't let automagic mode run more than this
-	// many times.
-	var maxRuns = 5
-	if options.Runs > 0 {
-		maxRuns = options.Runs
-	}
-
-	// Keep running until the document is finished or we hit an arbitrary limit.
-	var runs int
-	for rerun := true; rerun && runs < maxRuns; runs++ {
-		err = runLatex(document, options, dir, jobname)
-		if err != nil {
-			return nil, errors.Wrap(err, "compile tex to pdf")
-		}
-		// If in automagic mode, determine whether we need to run again.
-		if options.Runs == 0 {
-			rerun = needsRerun(dir)
-		}
+	if err := renderDocument(document, dir, jobname, options); err != nil {
+		return nil, errors.Wrap(err, "Rendering document")
 	}
 
 	// Slurp the output.
@@ -109,6 +120,33 @@ func Render(document io.Reader, options Options) ([]byte, error) {
 	// Clean up the temp directory.
 	_ = os.RemoveAll(dir)
 	return output, nil
+}
+
+func renderDocument(document io.Reader, outDir string, jobname string, options Options) error {
+	// Set default options.
+	if options.Command == "" {
+		options.Command = "pdflatex"
+	}
+
+	// Unless a number was given, don't let automagic mode run more than this
+	// many times.
+	var maxRuns = 5
+	if options.Runs > 0 {
+		maxRuns = options.Runs
+	}
+
+	// Keep running until the document is finished or we hit an arbitrary limit.
+	var runs int
+	for rerun := true; rerun && runs < maxRuns; runs++ {
+		if err := runLatex(document, options, outDir, jobname); err != nil {
+			return errors.Wrap(err, "compile tex to pdf")
+		}
+		// If in automagic mode, determine whether we need to run again.
+		if options.Runs == 0 {
+			rerun = needsRerun(outDir)
+		}
+	}
+	return nil
 }
 
 // runLatex does the actual work of spawning the child and waiting for it.
